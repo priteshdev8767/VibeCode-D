@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { WebContainer } from '@webcontainer/api';
 import { TemplateFolder } from '@/features/playground/libs/path-to-json';
 
@@ -20,6 +20,8 @@ export const useWebContainer = ({ templateData }: UseWebContainerProps): UseWebC
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [instance, setInstance] = useState<WebContainer | null>(null);
+  // Ref to track the latest instance so cleanup always has the current value
+  const instanceRef = useRef<WebContainer | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -27,9 +29,14 @@ export const useWebContainer = ({ templateData }: UseWebContainerProps): UseWebC
     async function initializeWebContainer() {
       try {
         const webcontainerInstance = await WebContainer.boot();
-        
-        if (!mounted) return;
-        
+
+        if (!mounted) {
+          // Component unmounted during boot — teardown immediately
+          webcontainerInstance.teardown();
+          return;
+        }
+
+        instanceRef.current = webcontainerInstance;
         setInstance(webcontainerInstance);
         setIsLoading(false);
       } catch (err) {
@@ -45,8 +52,9 @@ export const useWebContainer = ({ templateData }: UseWebContainerProps): UseWebC
 
     return () => {
       mounted = false;
-      if (instance) {
-        instance.teardown();
+      if (instanceRef.current) {
+        instanceRef.current.teardown();
+        instanceRef.current = null;
       }
     };
   }, []);

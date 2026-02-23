@@ -1,10 +1,22 @@
 import { create } from "zustand";
-
 import { toast } from "sonner";
+import { WebContainer } from "@webcontainer/api";
 import { TemplateFile, TemplateFolder } from "../types";
-import { SaveUpdatedCode } from "../actions";
 import { generateFileId } from "../libs";
-import { usePlayground } from "./usePlayground";
+import {
+  findFolderByPath,
+  deleteFileFromTree,
+  deleteFolderFromTree,
+  renameFileInTree,
+  renameFolderInTree
+} from "../libs/tree-utils";
+
+interface OpenFile extends TemplateFile {
+  id: string;
+  hasUnsavedChanges: boolean;
+  content: string;
+  originalContent: string;
+}
 
 interface FileExplorerState {
   playgroundId: string;
@@ -26,23 +38,25 @@ interface FileExplorerState {
     newFile: TemplateFile,
     parentPath: string,
     writeFileSync: (filePath: string, content: string) => Promise<void>,
-    instance: any,
+    instance: WebContainer | null,
     saveTemplateData: (data: TemplateFolder) => Promise<void>
   ) => Promise<void>;
   handleAddFolder: (
-    newFolder: TemplateFolder, 
-    parentPath: string, 
-    instance: any, 
+    newFolder: TemplateFolder,
+    parentPath: string,
+    instance: WebContainer | null,
     saveTemplateData: (data: TemplateFolder) => Promise<void>
   ) => Promise<void>;
   handleDeleteFile: (
-    file: TemplateFile, 
-    parentPath: string, 
+    file: TemplateFile,
+    parentPath: string,
+    instance: WebContainer | null,
     saveTemplateData: (data: TemplateFolder) => Promise<void>
   ) => Promise<void>;
   handleDeleteFolder: (
     folder: TemplateFolder,
     parentPath: string,
+    instance: WebContainer | null,
     saveTemplateData: (data: TemplateFolder) => Promise<void>
   ) => Promise<void>;
   handleRenameFile: (
@@ -50,42 +64,49 @@ interface FileExplorerState {
     newFilename: string,
     newExtension: string,
     parentPath: string,
+    instance: WebContainer | null,
     saveTemplateData: (data: TemplateFolder) => Promise<void>
   ) => Promise<void>;
   handleRenameFolder: (
     folder: TemplateFolder,
     newFolderName: string,
     parentPath: string,
+    instance: WebContainer | null,
     saveTemplateData: (data: TemplateFolder) => Promise<void>
   ) => Promise<void>;
+  syncFromFS: (instance: WebContainer | null) => Promise<void>;
   updateFileContent: (fileId: string, content: string) => void;
-}
-
-interface OpenFile extends TemplateFile {
-  id: string;
-  hasUnsavedChanges: boolean;
-  content: string;
-  originalContent: string;
 }
 
 export const useFileExplorer = create<FileExplorerState>((set, get) => ({
   templateData: null,
   playgroundId: "",
-  openFiles: [] satisfies OpenFile[],
+  openFiles: [],
   activeFileId: null,
   editorContent: "",
 
+  setPlaygroundId: (id) => set({ playgroundId: id }),
   setTemplateData: (data) => set({ templateData: data }),
-  setPlaygroundId(id) {
-    set({ playgroundId: id });
-  },
   setEditorContent: (content) => set({ editorContent: content }),
   setOpenFiles: (files) => set({ openFiles: files }),
   setActiveFileId: (fileId) => set({ activeFileId: fileId }),
 
+  syncFromFS: async (instance) => {
+    if (!instance || !instance.fs) return;
+    try {
+      const { scanWebContainerDirectory } = await import("../../webcontainers/libs/webcontainer-to-json");
+      const newTemplateData = await scanWebContainerDirectory(instance);
+      set({ templateData: newTemplateData });
+    } catch (error) {
+      console.error("Failed to sync from FS:", error);
+    }
+  },
+
   openFile: (file) => {
-    const fileId = generateFileId(file, get().templateData!);
-    const { openFiles } = get();
+    const { templateData, openFiles } = get();
+    if (!templateData) return;
+
+    const fileId = generateFileId(file, templateData);
     const existingFile = openFiles.find((f) => f.id === fileId);
 
     if (existingFile) {
@@ -111,19 +132,16 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
   closeFile: (fileId) => {
     const { openFiles, activeFileId } = get();
     const newFiles = openFiles.filter((f) => f.id !== fileId);
-    
-    // If we're closing the active file, switch to another file or clear active
+
     let newActiveFileId = activeFileId;
     let newEditorContent = get().editorContent;
-    
+
     if (activeFileId === fileId) {
       if (newFiles.length > 0) {
-        // Switch to the last file in the list
         const lastFile = newFiles[newFiles.length - 1];
         newActiveFileId = lastFile.id;
         newEditorContent = lastFile.content;
       } else {
-        // No files left
         newActiveFileId = null;
         newEditorContent = "";
       }
@@ -150,34 +168,21 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
 
     try {
       const updatedTemplateData = JSON.parse(JSON.stringify(templateData)) as TemplateFolder;
-      const pathParts = parentPath.split("/");
-      let currentFolder = updatedTemplateData;
+      const folder = findFolderByPath(updatedTemplateData, parentPath);
 
-      for (const part of pathParts) {
-        if (part) {
-          const nextFolder = currentFolder.items.find(
-            (item) => "folderName" in item && item.folderName === part
-          ) as TemplateFolder;
-          if (nextFolder) currentFolder = nextFolder;
+      if (folder) {
+        folder.items.push(newFile);
+        set({ templateData: updatedTemplateData });
+        await saveTemplateData(updatedTemplateData);
+
+        if (instance?.fs) {
+          const filePath = parentPath ? `${parentPath}/${newFile.filename}.${newFile.fileExtension}` : `${newFile.filename}.${newFile.fileExtension}`;
+          await writeFileSync(filePath, newFile.content || "");
         }
+
+        get().openFile(newFile);
+        toast.success(`Created file: ${newFile.filename}.${newFile.fileExtension}`);
       }
-
-      currentFolder.items.push(newFile);
-      set({ templateData: updatedTemplateData });
-      toast.success(`Created file: ${newFile.filename}.${newFile.fileExtension}`);
-
-      // Use the passed saveTemplateData function
-      await saveTemplateData(updatedTemplateData);
-
-      // Sync with web container
-      if (writeFileSync) {
-        const filePath = parentPath
-          ? `${parentPath}/${newFile.filename}.${newFile.fileExtension}`
-          : `${newFile.filename}.${newFile.fileExtension}`;
-        await writeFileSync(filePath, newFile.content || "");
-      }
-
-      get().openFile(newFile);
     } catch (error) {
       console.error("Error adding file:", error);
       toast.error("Failed to create file");
@@ -190,31 +195,19 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
 
     try {
       const updatedTemplateData = JSON.parse(JSON.stringify(templateData)) as TemplateFolder;
-      const pathParts = parentPath.split("/");
-      let currentFolder = updatedTemplateData;
+      const folder = findFolderByPath(updatedTemplateData, parentPath);
 
-      for (const part of pathParts) {
-        if (part) {
-          const nextFolder = currentFolder.items.find(
-            (item) => "folderName" in item && item.folderName === part
-          ) as TemplateFolder;
-          if (nextFolder) currentFolder = nextFolder;
+      if (folder) {
+        folder.items.push(newFolder);
+        set({ templateData: updatedTemplateData });
+        await saveTemplateData(updatedTemplateData);
+
+        if (instance?.fs) {
+          const folderPath = parentPath ? `${parentPath}/${newFolder.folderName}` : newFolder.folderName;
+          await instance.fs.mkdir(folderPath, { recursive: true });
         }
-      }
 
-      currentFolder.items.push(newFolder);
-      set({ templateData: updatedTemplateData });
-      toast.success(`Created folder: ${newFolder.folderName}`);
-
-      // Use the passed saveTemplateData function
-      await saveTemplateData(updatedTemplateData);
-
-      // Sync with web container
-      if (instance && instance.fs) {
-        const folderPath = parentPath
-          ? `${parentPath}/${newFolder.folderName}`
-          : newFolder.folderName;
-        await instance.fs.mkdir(folderPath, { recursive: true });
+        toast.success(`Created folder: ${newFolder.folderName}`);
       }
     } catch (error) {
       console.error("Error adding folder:", error);
@@ -222,163 +215,77 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
     }
   },
 
-  handleDeleteFile: async (file, parentPath, saveTemplateData) => {
+  handleDeleteFile: async (file, parentPath, instance, saveTemplateData) => {
     const { templateData, openFiles } = get();
     if (!templateData) return;
 
     try {
-      const updatedTemplateData = JSON.parse(
-        JSON.stringify(templateData)
-      ) as TemplateFolder;
-      const pathParts = parentPath.split("/");
-      let currentFolder = updatedTemplateData;
+      const updatedTemplateData = JSON.parse(JSON.stringify(templateData)) as TemplateFolder;
+      if (deleteFileFromTree(updatedTemplateData, file.filename, file.fileExtension, parentPath)) {
+        const fileId = `${parentPath}/${file.filename}.${file.fileExtension}`;
 
-      for (const part of pathParts) {
-        if (part) {
-          const nextFolder = currentFolder.items.find(
-            (item) => "folderName" in item && item.folderName === part
-          ) as TemplateFolder;
-          if (nextFolder) currentFolder = nextFolder;
+        set({
+          templateData: updatedTemplateData,
+          openFiles: openFiles.filter((f) => f.id !== fileId),
+        });
+
+        await saveTemplateData(updatedTemplateData);
+
+        if (instance?.fs) {
+          const filePath = parentPath ? `${parentPath}/${file.filename}.${file.fileExtension}` : `${file.filename}.${file.fileExtension}`;
+          await instance.fs.rm(filePath).catch(() => { });
+        }
+
+        toast.success(`Deleted file: ${file.filename}.${file.fileExtension}`);
+        if (get().activeFileId === fileId) {
+          get().closeFile(fileId);
         }
       }
-
-      currentFolder.items = currentFolder.items.filter(
-        (item) =>
-          !("filename" in item) ||
-          item.filename !== file.filename ||
-          item.fileExtension !== file.fileExtension
-      );
-
-      // Find and close the file if it's open
-      // Use the same ID generation logic as in openFile
-      const fileId = generateFileId(file, templateData);
-      const openFile = openFiles.find((f) => f.id === fileId);
-      
-      if (openFile) {
-        // Close the file using the closeFile method
-        get().closeFile(fileId);
-      }
-
-      set({ templateData: updatedTemplateData });
-
-      // Use the passed saveTemplateData function
-      await saveTemplateData(updatedTemplateData);
-      toast.success(`Deleted file: ${file.filename}.${file.fileExtension}`);
     } catch (error) {
       console.error("Error deleting file:", error);
       toast.error("Failed to delete file");
     }
   },
 
-  handleDeleteFolder: async (folder, parentPath, saveTemplateData) => {
+  handleDeleteFolder: async (folder, parentPath, instance, saveTemplateData) => {
     const { templateData } = get();
     if (!templateData) return;
 
     try {
-      const updatedTemplateData = JSON.parse(
-        JSON.stringify(templateData)
-      ) as TemplateFolder;
-      const pathParts = parentPath.split("/");
-      let currentFolder = updatedTemplateData;
+      const updatedTemplateData = JSON.parse(JSON.stringify(templateData)) as TemplateFolder;
+      if (deleteFolderFromTree(updatedTemplateData, folder.folderName, parentPath)) {
+        set({ templateData: updatedTemplateData });
+        await saveTemplateData(updatedTemplateData);
 
-      for (const part of pathParts) {
-        if (part) {
-          const nextFolder = currentFolder.items.find(
-            (item) => "folderName" in item && item.folderName === part
-          ) as TemplateFolder;
-          if (nextFolder) currentFolder = nextFolder;
+        if (instance?.fs) {
+          const folderPath = parentPath ? `${parentPath}/${folder.folderName}` : folder.folderName;
+          await instance.fs.rm(folderPath, { recursive: true }).catch(() => { });
         }
+
+        toast.success(`Deleted folder: ${folder.folderName}`);
       }
-
-      currentFolder.items = currentFolder.items.filter(
-        (item) =>
-          !("folderName" in item) || item.folderName !== folder.folderName
-      );
-
-      // Close all files in the deleted folder recursively
-      const closeFilesInFolder = (folder: TemplateFolder, currentPath: string = "") => {
-        folder.items.forEach((item) => {
-          if ("filename" in item) {
-            // Generate the correct file ID using the same logic as openFile
-            const fileId = generateFileId(item, templateData);
-            get().closeFile(fileId);
-          } else if ("folderName" in item) {
-            const newPath = currentPath ? `${currentPath}/${item.folderName}` : item.folderName;
-            closeFilesInFolder(item, newPath);
-          }
-        });
-      };
-      
-      closeFilesInFolder(folder, parentPath ? `${parentPath}/${folder.folderName}` : folder.folderName);
-
-      set({ templateData: updatedTemplateData });
-
-      // Use the passed saveTemplateData function
-      await saveTemplateData(updatedTemplateData);
-      toast.success(`Deleted folder: ${folder.folderName}`);
     } catch (error) {
       console.error("Error deleting folder:", error);
       toast.error("Failed to delete folder");
     }
   },
 
-  handleRenameFile: async (
-    file,
-    newFilename,
-    newExtension,
-    parentPath,
-    saveTemplateData
-  ) => {
+  handleRenameFile: async (file, newFilename, newExtension, parentPath, instance, saveTemplateData) => {
     const { templateData, openFiles, activeFileId } = get();
     if (!templateData) return;
 
-    // Generate old and new file IDs using the same logic as openFile
-    const oldFileId = generateFileId(file, templateData);
-    const newFile = { ...file, filename: newFilename, fileExtension: newExtension };
-    const newFileId = generateFileId(newFile, templateData);
-
     try {
-      const updatedTemplateData = JSON.parse(
-        JSON.stringify(templateData)
-      ) as TemplateFolder;
-      const pathParts = parentPath.split("/");
-      let currentFolder = updatedTemplateData;
+      const updatedTemplateData = JSON.parse(JSON.stringify(templateData)) as TemplateFolder;
+      if (renameFileInTree(updatedTemplateData, file.filename, file.fileExtension, newFilename, newExtension, parentPath)) {
+        const oldFileId = `${parentPath}/${file.filename}.${file.fileExtension}`;
+        const newFileId = `${parentPath}/${newFilename}.${newExtension}`;
 
-      for (const part of pathParts) {
-        if (part) {
-          const nextFolder = currentFolder.items.find(
-            (item) => "folderName" in item && item.folderName === part
-          ) as TemplateFolder;
-          if (nextFolder) currentFolder = nextFolder;
-        }
-      }
-
-      const fileIndex = currentFolder.items.findIndex(
-        (item) =>
-          "filename" in item &&
-          item.filename === file.filename &&
-          item.fileExtension === file.fileExtension
-      );
-
-      if (fileIndex !== -1) {
-        const updatedFile = {
-          ...currentFolder.items[fileIndex],
-          filename: newFilename,
-          fileExtension: newExtension,
-        } as TemplateFile;
-        currentFolder.items[fileIndex] = updatedFile;
-
-        // Update open files with new ID and names
-        const updatedOpenFiles = openFiles.map((f) =>
-          f.id === oldFileId
-            ? {
-                ...f,
-                id: newFileId,
-                filename: newFilename,
-                fileExtension: newExtension,
-              }
-            : f
-        );
+        const updatedOpenFiles = openFiles.map((f) => {
+          if (f.id === oldFileId) {
+            return { ...f, id: newFileId, filename: newFilename, fileExtension: newExtension };
+          }
+          return f;
+        });
 
         set({
           templateData: updatedTemplateData,
@@ -386,8 +293,14 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
           activeFileId: activeFileId === oldFileId ? newFileId : activeFileId,
         });
 
-        // Use the passed saveTemplateData function
         await saveTemplateData(updatedTemplateData);
+
+        if (instance?.fs) {
+          const oldPath = parentPath ? `${parentPath}/${file.filename}.${file.fileExtension}` : `${file.filename}.${file.fileExtension}`;
+          const newPath = parentPath ? `${parentPath}/${newFilename}.${newExtension}` : `${newFilename}.${newExtension}`;
+          await instance.fs.rename(oldPath, newPath).catch(() => { });
+        }
+
         toast.success(`Renamed file to: ${newFilename}.${newExtension}`);
       }
     } catch (error) {
@@ -396,41 +309,22 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
     }
   },
 
-  handleRenameFolder: async (folder, newFolderName, parentPath, saveTemplateData) => {
+  handleRenameFolder: async (folder, newFolderName, parentPath, instance, saveTemplateData) => {
     const { templateData } = get();
     if (!templateData) return;
 
     try {
-      const updatedTemplateData = JSON.parse(
-        JSON.stringify(templateData)
-      ) as TemplateFolder;
-      const pathParts = parentPath.split("/");
-      let currentFolder = updatedTemplateData;
-
-      for (const part of pathParts) {
-        if (part) {
-          const nextFolder = currentFolder.items.find(
-            (item) => "folderName" in item && item.folderName === part
-          ) as TemplateFolder;
-          if (nextFolder) currentFolder = nextFolder;
-        }
-      }
-
-      const folderIndex = currentFolder.items.findIndex(
-        (item) => "folderName" in item && item.folderName === folder.folderName
-      );
-
-      if (folderIndex !== -1) {
-        const updatedFolder = {
-          ...currentFolder.items[folderIndex],
-          folderName: newFolderName,
-        } as TemplateFolder;
-        currentFolder.items[folderIndex] = updatedFolder;
-
+      const updatedTemplateData = JSON.parse(JSON.stringify(templateData)) as TemplateFolder;
+      if (renameFolderInTree(updatedTemplateData, folder.folderName, newFolderName, parentPath)) {
         set({ templateData: updatedTemplateData });
-
-        // Use the passed saveTemplateData function
         await saveTemplateData(updatedTemplateData);
+
+        if (instance?.fs) {
+          const oldPath = parentPath ? `${parentPath}/${folder.folderName}` : folder.folderName;
+          const newPath = parentPath ? `${parentPath}/${newFolderName}` : newFolderName;
+          await instance.fs.rename(oldPath, newPath).catch(() => { });
+        }
+
         toast.success(`Renamed folder to: ${newFolderName}`);
       }
     } catch (error) {
@@ -444,14 +338,13 @@ export const useFileExplorer = create<FileExplorerState>((set, get) => ({
       openFiles: state.openFiles.map((file) =>
         file.id === fileId
           ? {
-              ...file,
-              content,
-              hasUnsavedChanges: content !== file.originalContent,
-            }
+            ...file,
+            content,
+            hasUnsavedChanges: content !== file.originalContent,
+          }
           : file
       ),
-      editorContent:
-        fileId === state.activeFileId ? content : state.editorContent,
+      editorContent: fileId === state.activeFileId ? content : state.editorContent,
     }));
   },
 }));

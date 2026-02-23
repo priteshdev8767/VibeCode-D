@@ -1,6 +1,7 @@
 "use client";
 
 import type React from "react";
+import { CHAT_MODELS, DEFAULT_MODEL, type ChatModel } from "@/lib/chat-models";
 import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -28,6 +29,7 @@ import {
   Search,
   Filter,
   Download,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
@@ -104,6 +106,7 @@ interface AIChatSidePanelProps {
   activeFileLanguage?: string;
   cursorPosition?: { line: number; column: number };
   theme?: "dark" | "light";
+  playgroundId?: string;
 }
 
 const MessageTypeIndicator: React.FC<{
@@ -311,6 +314,7 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
   activeFileLanguage,
   cursorPosition,
   theme = "dark",
+  playgroundId,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -324,7 +328,9 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
   const [filterType, setFilterType] = useState<string>("all");
   const [showSettings, setShowSettings] = useState(false);
   const [autoSave, setAutoSave] = useState(true);
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODEL);
   const [streamResponse, setStreamResponse] = useState(true);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -334,6 +340,35 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   };
+
+  // Load chat history from MongoDB on mount
+  useEffect(() => {
+    if (historyLoaded) return;
+    const loadHistory = async () => {
+      try {
+        const params = playgroundId ? `?playgroundId=${playgroundId}` : "";
+        const res = await fetch(`/api/chat/history${params}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.messages && data.messages.length > 0) {
+            const loaded: ChatMessage[] = data.messages.map((m: any) => ({
+              id: m.id,
+              role: m.role as "user" | "assistant",
+              content: m.content,
+              timestamp: new Date(m.createdAt),
+              model: m.model || undefined,
+            }));
+            setMessages(loaded);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to load chat history:", err);
+      } finally {
+        setHistoryLoaded(true);
+      }
+    };
+    loadHistory();
+  }, [playgroundId, historyLoaded]);
 
   useEffect(() => {
     const timeoutId = setTimeout(() => {
@@ -704,10 +739,10 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
       chatMode === "chat"
         ? "chat"
         : chatMode === "review"
-        ? "code_review"
-        : chatMode === "fix"
-        ? "error_fix"
-        : "optimization";
+          ? "code_review"
+          : chatMode === "fix"
+            ? "error_fix"
+            : "optimization";
     const newMessage: ChatMessage = {
       role: "user",
       content: input.trim(),
@@ -733,12 +768,11 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
       if (attachments.length > 0) {
         contextualMessage += "\n\nAttached files:\n";
         attachments.forEach((file) => {
-          contextualMessage += `\n**${file.name}** (${file.language}, ${
-            file.type
-          }):\n\`\`\`${file.language}\n${file.content.substring(
-            0,
-            1000
-          )}\n\`\`\`\n`;
+          contextualMessage += `\n**${file.name}** (${file.language}, ${file.type
+            }):\n\`\`\`${file.language}\n${file.content.substring(
+              0,
+              1000
+            )}\n\`\`\`\n`;
         });
       }
 
@@ -749,6 +783,8 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
         },
         body: JSON.stringify({
           message: contextualMessage,
+          model: selectedModel,
+          playgroundId,
           history: messages.slice(-10).map((msg) => ({
             role: msg.role,
             content: msg.content,
@@ -941,6 +977,60 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
                   </Tooltip>
                 )}
 
+                {/* Model Selector Dropdown */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 max-w-[200px]"
+                    >
+                      <span className="truncate text-xs">
+                        {selectedModel === "all"
+                          ? "⚡ All Models"
+                          : `${CHAT_MODELS.find((m) => m.id === selectedModel)?.icon || "🤖"} ${CHAT_MODELS.find((m) => m.id === selectedModel)?.name || selectedModel}`}
+                      </span>
+                      <ChevronDown className="h-3 w-3 ml-1 shrink-0" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-64 max-h-80 overflow-y-auto">
+                    <DropdownMenuItem
+                      onClick={() => setSelectedModel("all")}
+                      className={cn(
+                        "flex items-center gap-2",
+                        selectedModel === "all" && "bg-blue-500/10 text-blue-400"
+                      )}
+                    >
+                      <span>⚡</span>
+                      <div className="flex-1">
+                        <div className="text-sm font-medium">All Models (Race)</div>
+                        <div className="text-xs text-zinc-500">Fastest response wins</div>
+                      </div>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    {CHAT_MODELS.map((model) => (
+                      <DropdownMenuItem
+                        key={model.id}
+                        onClick={() => setSelectedModel(model.id)}
+                        className={cn(
+                          "flex items-center gap-2",
+                          selectedModel === model.id && "bg-blue-500/10 text-blue-400"
+                        )}
+                      >
+                        <span>{model.icon}</span>
+                        <div className="flex-1">
+                          <div className="text-sm">{model.name}</div>
+                        </div>
+                        {model.free && (
+                          <Badge variant="outline" className="text-[10px] px-1 py-0 text-green-400 border-green-500/30">
+                            Free
+                          </Badge>
+                        )}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
                 <Button
                   variant="ghost"
                   size="sm"
@@ -979,7 +1069,12 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
                       <Download className="h-4 w-4 mr-2" />
                       Export Chat
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => setMessages([])}>
+                    <DropdownMenuItem onClick={() => {
+                      setMessages([]);
+                      // Also clear from MongoDB
+                      const params = playgroundId ? `?playgroundId=${playgroundId}` : "";
+                      fetch(`/api/chat/history${params}`, { method: "DELETE" }).catch(console.error);
+                    }}>
                       Clear All Messages
                     </DropdownMenuItem>
                   </DropdownMenuContent>
@@ -1146,25 +1241,36 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
                           remarkPlugins={[remarkGfm, remarkMath]}
                           rehypePlugins={[rehypeKatex]}
                           components={{
+                            p: ({ children, ...props }) => (
+                              <div className="mb-4 last:mb-0" {...props}>
+                                {children}
+                              </div>
+                            ),
                             code: ({
                               children,
                               className,
-                              inline: _inline,
-                            }) => (
-                              <EnhancedCodeBlock
-                                className={className}
-                                inline={_inline as boolean}
-                                onInsert={
-                                  onInsertCode
-                                    ? (code) => handleInsertCode(code)
-                                    : undefined
-                                }
-                                onRun={onRunCode}
-                                theme={theme}
-                              >
-                                {String(children)}
-                              </EnhancedCodeBlock>
-                            ),
+                              ...props
+                            }) => {
+                              const match = /language-(\w+)/.exec(className || "");
+                              const isInline = !match;
+
+                              return (
+                                <EnhancedCodeBlock
+                                  className={className}
+                                  inline={isInline}
+                                  onInsert={
+                                    onInsertCode
+                                      ? (code) => handleInsertCode(code)
+                                      : undefined
+                                  }
+                                  onRun={onRunCode}
+                                  theme={theme}
+                                  {...props}
+                                >
+                                  {String(children)}
+                                </EnhancedCodeBlock>
+                              );
+                            },
                           }}
                         >
                           {msg.content}
@@ -1183,7 +1289,7 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
                               <EnhancedFilePreview
                                 key={file.id}
                                 file={file}
-                                onRemove={() => {}}
+                                onRemove={() => { }}
                                 compact={true}
                                 onInsert={
                                   onInsertCode
@@ -1273,10 +1379,10 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
                       {chatMode === "review"
                         ? "Analyzing code structure and patterns..."
                         : chatMode === "fix"
-                        ? "Identifying issues and solutions..."
-                        : chatMode === "optimize"
-                        ? "Analyzing performance bottlenecks..."
-                        : "Processing your request..."}
+                          ? "Identifying issues and solutions..."
+                          : chatMode === "optimize"
+                            ? "Analyzing performance bottlenecks..."
+                            : "Processing your request..."}
                     </span>
                   </div>
                 </div>
@@ -1336,10 +1442,10 @@ export const AIChatSidePanel: React.FC<AIChatSidePanelProps> = ({
                     chatMode === "chat"
                       ? "Ask about your code, request improvements, or paste code to analyze..."
                       : chatMode === "review"
-                      ? "Describe what you'd like me to review in your code..."
-                      : chatMode === "fix"
-                      ? "Describe the issue you're experiencing..."
-                      : "Describe what you'd like me to optimize..."
+                        ? "Describe what you'd like me to review in your code..."
+                        : chatMode === "fix"
+                          ? "Describe the issue you're experiencing..."
+                          : "Describe what you'd like me to optimize..."
                   }
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
